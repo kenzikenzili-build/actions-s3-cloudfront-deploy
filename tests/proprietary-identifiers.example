@@ -1,0 +1,46 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# tests/proprietary-identifiers.example
+#
+# Format reference for the operator's own forbidden values.
+#
+# This repository is published, so it deliberately contains none of the values it
+# must be protected against: a scanner that ships the account ids, distribution
+# ids, hostnames and organisation names it forbids publishes exactly what it is
+# meant to protect. Supply the list out-of-band instead, one entry per line, in
+# `<label>|<extended-regex>` form:
+#
+#   * In CI, set the PROPRIETARY_IDENTIFIERS repository secret
+#     (Settings → Secrets and variables → Actions) to the list. It is encrypted
+#     at rest and never committed.
+#
+#   * Locally, copy this file to tests/proprietary-identifiers.local, which is
+#     git-ignored, and fill it in.
+#
+# Then `tests/verify-no-identifiers.sh` fails when any listed value appears in the
+# tree. Matched values are reported as <redacted> so a public CI log cannot become
+# the leak, and REQUIRE_PROPRIETARY_LIST=1 turns a missing list into a hard
+# failure (CI sets that wherever the secret exists).
+#
+# Rules: blank lines and lines starting with `#` are ignored. An entry with no `|`
+# is treated as a literal string to look for. Documentation placeholders
+# (000000000000, 111122223333, 123456789012, EXAMPLE, PLACEHOLDER, REDACTED,
+# your-, dummy, CHANGEME) are allowlisted for the generic credential/ARN shapes
+# only — a value you list yourself is always enforced, with no exceptions.
+#
+# The examples are commented out on purpose: a live entry here would have to be a
+# placeholder, and the template file itself contains it, which would produce a
+# finding against this file the moment you copied it. Uncomment and replace with
+# your own values in tests/proprietary-identifiers.local — never in this file.
+#
+#   proprietary-account-id|<your 12-digit account id>
+#   proprietary-org|<the github org or user that owns your deploys>
+#   proprietary-repo|<an internal repository name>
+#   proprietary-distribution|<a cloudfront distribution id>
+#   proprietary-host|<a hostname you operate, dots escaped: example\.com>
+#   proprietary-project|<an internal project name>
+#   proprietary-bucket|<an s3 bucket name that is not public knowledge>
+#
+# Accepts extended regex, so several values can share one line:
+#
+#   proprietary-distribution|DISTIDONE|DISTIDTWO|DISTIDTHREE
+#   proprietary-host|example\.com|example\.internal

@@ -1,0 +1,71 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Minimal caller workflow — copy this into the site repository and adjust the
+# four values marked below. Nothing else is required.
+#
+# The reusable workflow assumes an IAM role through GitHub OIDC, syncs the build
+# output to S3, and invalidates CloudFront. No AWS keys are involved.
+# ─────────────────────────────────────────────────────────────────────────────
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  id-token: write # required: the called workflow exchanges this OIDC token for credentials
+  contents: read
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false # never interrupt a sync half-way through
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm ci
+      - run: npm run build # produces ./dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: site-dist
+          path: ./dist
+          retention-days: 1
+
+  deploy:
+    name: Deploy to S3 + CloudFront
+    needs: build
+    # Pin the reviewed release. Prefer the tag (or a commit SHA) over a branch: an
+    # upstream change must not be able to alter your deploy behaviour unreviewed.
+    uses: kenzikenzili-build/actions-s3-cloudfront-deploy/.github/workflows/deploy-s3-cloudfront.yml@v1.0.0
+    with:
+      # 1. Where the build output lives in this job's workspace.
+      artifact_name: site-dist
+      artifact_path: ./dist
+
+      # 2. Your bucket and region.
+      s3_bucket: my-site-prod
+      aws_region: us-east-1
+
+      # 3. The role created by scripts/setup-project-infra.sh, assumed via OIDC.
+      #    This is an identifier, not a credential — it is safe in plain text.
+      role_to_assume: arn:aws:iam::111122223333:role/my-site-prod-deploy-role
+
+      # 4. Your CloudFront distribution (omit to skip invalidation).
+      cloudfront_distribution_id: EXXXXXXXXXXXXX
+
+      # 5. DATA SAFETY — every prefix a backend/runtime owns. Anything listed
+      #    here is protected from BOTH the upload and the `--delete` phase, so a
+      #    deploy can never wipe it. A bare prefix (`data`) is normalised to
+      #    `data/*` for you. Leave it out and a plain `--delete` sync will remove
+      #    those live objects.
+      sync_exclude_paths: |
+        data/*
+        telemetry.json
+
+    secrets: inherit

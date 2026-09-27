@@ -1,0 +1,89 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Default-deny for anything that could carry a credential or an account-
+# identifying dump. This repo is a reusable building block: a secret that lands
+# here is inherited by every caller, so nothing credential-shaped is allowed in.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Environment files (keep .example variants only)
+.env
+.env.*
+*.env
+*.env.*
+!.env.example
+!*.env.example
+*.secret
+*.secrets
+
+# Keys and certificates
+*.pem
+*.key
+*.p8
+*.p12
+*.pfx
+*.jks
+*.keystore
+id_rsa*
+id_ed25519*
+id_ecdsa*
+*.ppk
+.netrc
+credentials
+credentials.json
+*-service-account*.json
+service-account*.json
+
+# Cloud credentials and infrastructure dumps
+.aws/
+.aws-sam/
+kubeconfig
+.kube/
+gcloud/
+cf-*.json
+*-cloudfront-dump*.json
+*-account-dump*.json
+
+# Infrastructure state (can contain plaintext secrets)
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+.terraform.lock.hcl
+.vercel/
+.sst
+.open-next
+
+# Proprietary identifier list for tests/verify-no-identifiers.sh. The values it
+# holds are exactly what this repository must never publish, so the real list is
+# kept out of git: use the PROPRIETARY_IDENTIFIERS secret in CI, and a local file
+# (copied from tests/proprietary-identifiers.example) when working offline.
+tests/proprietary-identifiers.local
+*.identifiers.local
+
+# Logs, build output, caches
+*.log
+logs/
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+*.tmp
+*.swp
+*.swo
+*~
+dist/
+out/
+build/
+coverage/
+node_modules/
+.cache/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Editor / OS noise
+.DS_Store
+.DS_Store?
+._*
+Thumbs.db
+.idea/
+.vscode/

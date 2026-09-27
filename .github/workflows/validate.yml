@@ -1,0 +1,97 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Validation for this repository.
+#
+# The repo is a reusable pipeline that other repositories trust with production
+# credentials, so its own guarantees are tested on every push:
+#
+#   1. no proprietary identifiers or credential shapes anywhere (audit gate),
+#   2. all shell scripts parse,
+#   3. every workflow YAML deserialises,
+#   4. the provisioning script's dry-run contract holds (structure, least
+#      privilege, and "dry-run mutates nothing") against a stubbed AWS CLI.
+#
+# Only actions/checkout is used: the checks themselves are plain shell.
+# ─────────────────────────────────────────────────────────────────────────────
+name: Validate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Static checks + offline smoke tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Installed and asserted before anything else runs. The smoke tests read the
+      # workflow YAML, and a dependency that is silently missing turns a test into
+      # a no-op that still exits 0 — so a missing parser is a hard failure here.
+      - name: Install test dependencies
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet --disable-pip-version-check pyyaml
+          python3 -c 'import yaml; print("PyYAML", yaml.__version__)'
+
+      - name: Shell syntax
+        run: |
+          set -euo pipefail
+          for script in scripts/setup-project-infra.sh tests/verify-no-identifiers.sh tests/verify-no-inline-expressions.sh tests/smoke-infra-dryrun.sh tests/smoke-workflow-sync.sh; do
+            bash -n "$script"
+            echo "  ok: $script"
+          done
+
+      - name: Workflow YAML parses
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import glob, sys
+          import yaml
+
+          paths = sorted(glob.glob(".github/workflows/*.yml")) + sorted(glob.glob("examples/*.yml"))
+          if not paths:
+              print("  FAIL: no workflow YAML was found to parse")
+              sys.exit(1)
+          failed = False
+          for path in paths:
+              try:
+                  with open(path) as fh:
+                      yaml.safe_load(fh)
+                  print(f"  ok: {path}")
+              except Exception as exc:  # noqa: BLE001 - surface any parse failure
+                  print(f"  FAIL: {path}: {exc}")
+                  failed = True
+          sys.exit(1 if failed else 0)
+          PY
+
+      # No `${{ }}` expression may appear inside a `run:` block: an interpolated
+      # input is executed by the shell, so it is a script-injection surface.
+      - name: No expressions interpolated into run blocks
+        run: tests/verify-no-inline-expressions.sh
+
+      - name: No proprietary identifiers
+        env:
+          # The values this repository must never contain are supplied from a
+          # secret, never from the tree — a scanner that ships the values it
+          # forbids publishes them. See tests/proprietary-identifiers.example.
+          PROPRIETARY_IDENTIFIERS: ${{ secrets.PROPRIETARY_IDENTIFIERS }}
+          # Strict only where the secret is guaranteed to exist, so the audit can
+          # never quietly degrade to "generic shapes only": on the canonical
+          # repository a missing list fails the job (exit 2). A fork inherits no
+          # secrets, and there the scanner announces the skip in its output
+          # instead of failing for a reason the fork cannot fix.
+          REQUIRE_PROPRIETARY_LIST: ${{ github.repository == 'kenzikenzili-build/actions-s3-cloudfront-deploy' && '1' || '0' }}
+        run: tests/verify-no-identifiers.sh
+
+      - name: Provisioning script dry-run contract
+        run: tests/smoke-infra-dryrun.sh
+
+      - name: Data-safety guard reaches every sync pass
+        run: tests/smoke-workflow-sync.sh
