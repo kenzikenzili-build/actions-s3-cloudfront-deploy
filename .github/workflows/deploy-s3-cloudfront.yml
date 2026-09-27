@@ -1,0 +1,344 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Reusable workflow: keyless static-site deployment to S3 + CloudFront
+#
+# Four properties make this pipeline production-grade. They are the reason this
+# file exists as a standalone unit and must survive any refactor:
+#
+#   1. KEYLESS AUTH          GitHub's OIDC token is exchanged for short-lived STS
+#                            credentials. There is no AWS access key anywhere in
+#                            this repo, in caller repos, or in Actions secrets.
+#
+#   2. DATA-SAFETY GUARD     `sync_exclude_paths` protects live objects from
+#                            `aws s3 sync --delete`. A CI artefact that contains
+#                            only the build output will otherwise DELETE every
+#                            object a runtime pipeline wrote into the bucket
+#                            (telemetry, JSON feeds, uploads). See README.
+#
+#   3. TWO-TIER CACHE        Fingerprinted assets go up immutable (1 year),
+#                            entry points go up revalidated. A single sync with
+#                            one Cache-Control header always ends with either a
+#                            stale HTML shell pinned in browsers, or hashed
+#                            assets re-downloaded on every request.
+#
+#   4. CACHE INVALIDATION    Optional CloudFront invalidation after the sync so
+#                            the edge never serves the previous build.
+#
+# Everything specific to an account, bucket or distribution arrives as an input.
+# Nothing about the caller's infrastructure is hardcoded here.
+# ─────────────────────────────────────────────────────────────────────────────
+name: Reusable Static Deploy (S3 + CloudFront)
+
+on:
+  workflow_call:
+    inputs:
+      # ── Target ───────────────────────────────────────────────────────────────
+      s3_bucket:
+        required: true
+        type: string
+        description: "Name of the S3 bucket that receives the build artefacts."
+      artifact_path:
+        required: false
+        type: string
+        default: "./dist"
+        description: "Path of the build output to sync (relative to the workspace)."
+      artifact_name:
+        required: false
+        type: string
+        default: ""
+        description: "Optional: name of an Actions artifact uploaded by a previous job. When set, the artefact is downloaded into artifact_path instead of being read from the checked-out repo."
+      cloudfront_distribution_id:
+        required: false
+        type: string
+        default: ""
+        description: "Optional: CloudFront distribution id to invalidate. When empty, the invalidation step is skipped entirely."
+      invalidation_paths:
+        required: false
+        type: string
+        default: "/*"
+        description: "One invalidation path per line. Defaults to /* (everything)."
+
+      # ── AWS / OIDC ───────────────────────────────────────────────────────────
+      role_to_assume:
+        required: false
+        type: string
+        default: ""
+        description: "IAM role ARN assumed through GitHub OIDC. Preferred over the AWS_ROLE_ARN secret: a role ARN is an identifier, not a credential. Required unless AWS_ROLE_ARN is provided."
+      aws_region:
+        required: false
+        type: string
+        default: "us-east-1"
+        description: "AWS region of the target bucket (also used for the STS and CloudFront calls)."
+
+      # ── Data safety ──────────────────────────────────────────────────────────
+      sync_exclude_paths:
+        required: false
+        type: string
+        default: ""
+        description: |-
+          One `aws s3 sync` exclusion pattern per line. `--exclude` is honoured by
+          BOTH the upload and the delete phase, so a pattern listed here can
+          neither be overwritten by a stale build snapshot nor removed by
+          `--delete`. Use it for pipeline-owned prefixes such as `data/*` and
+          `telemetry.json`. The empty default keeps the plain `--delete` behaviour.
+
+      # ── Cache policy ─────────────────────────────────────────────────────────
+      tiered_cache_control:
+        required: false
+        type: boolean
+        default: true
+        description: "true (recommended): upload in two passes — immutable assets, then revalidated entry points. false: a single pass with no Cache-Control override."
+      immutable_cache_control:
+        required: false
+        type: string
+        default: "public, max-age=31536000, immutable"
+        description: "Cache-Control header for the immutable (pass 1) upload."
+      revalidate_cache_control:
+        required: false
+        type: string
+        default: "no-cache, no-store, must-revalidate"
+        description: "Cache-Control header for entry points (pass 2), which must never be pinned in a browser."
+      immutable_exclude_patterns:
+        required: false
+        type: string
+        default: |
+          *.html
+          *.xml
+          *.webmanifest
+          manifest.json
+          sw.js
+          service-worker.js
+        description: "One pattern per line. Objects matching these are NOT part of the immutable upload — they are handled by the revalidating upload instead."
+      revalidate_include_patterns:
+        required: false
+        type: string
+        default: |
+          *.html
+          *.xml
+          *.webmanifest
+          manifest.json
+          sw.js
+          service-worker.js
+        description: "One pattern per line. Entry points that must be revalidated on every request. Keep this list aligned with immutable_exclude_patterns."
+
+    secrets:
+      AWS_ROLE_ARN:
+        required: false
+        description: "Optional fallback for role_to_assume. Prefer the input; use this only when your org keeps role ARNs in repository or organisation secrets."
+
+# The called workflow requests the minimum it needs: an OIDC id-token (to prove
+# the workflow's identity to AWS) and read access to the caller's contents.
+# No `contents: write`, no static keys.
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy to S3 & CloudFront
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout caller repository
+        # Only needed when the build output lives in the repo/workspace. When a
+        # pre-built artifact is supplied we skip the checkout entirely.
+        if: inputs.artifact_name == ''
+        uses: actions/checkout@v4
+
+      - name: Download build artifact
+        if: inputs.artifact_name != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: ${{ inputs.artifact_path }}
+
+      - name: Configure AWS credentials (keyless OIDC)
+        # No aws-access-key-id / aws-secret-access-key is ever provided.
+        # configure-aws-credentials obtains an OIDC token from the workflow
+        # runtime, calls sts:AssumeRoleWithWebIdentity, and exports short-lived
+        # credentials that expire when the job ends.
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ inputs.role_to_assume || secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ inputs.aws_region }}
+          role-session-name: gha-s3-cloudfront-${{ github.run_id }}
+
+      - name: Validate inputs
+        env:
+          ARTIFACT_PATH: ${{ inputs.artifact_path }}
+          ROLE_TO_ASSUME: ${{ inputs.role_to_assume || secrets.AWS_ROLE_ARN }}
+          CF_DISTRIBUTION_ID: ${{ inputs.cloudfront_distribution_id }}
+        run: |
+          set -euo pipefail
+          fail=0
+
+          if [ -z "${ROLE_TO_ASSUME}" ]; then
+            echo "::error title=Missing role::Provide 'role_to_assume' (or the AWS_ROLE_ARN secret). Keyless OIDC needs a role to assume; this workflow never accepts static keys."
+            fail=1
+          fi
+
+          if [ ! -d "${ARTIFACT_PATH}" ]; then
+            echo "::error title=Missing artefacts::artifact_path '${ARTIFACT_PATH}' does not exist. Check the build job's output path or the artifact_name."
+            fail=1
+          elif [ -z "$(ls -A "${ARTIFACT_PATH}" 2>/dev/null)" ]; then
+            echo "::error title=Empty artefacts::artifact_path '${ARTIFACT_PATH}' is empty. Refusing to run a destructive sync from an empty source."
+            fail=1
+          fi
+
+          if [ -n "${CF_DISTRIBUTION_ID}" ]; then
+            case "${CF_DISTRIBUTION_ID}" in
+              *[!A-Z0-9]*) echo "::warning title=Odd distribution id::cloudfront_distribution_id '${CF_DISTRIBUTION_ID}' does not look like a distribution id; the invalidation step may fail." ;;
+            esac
+          fi
+
+          echo "Target bucket: ${{ inputs.s3_bucket }}"
+          echo "Region:        ${{ inputs.aws_region }}"
+          echo "Artefact:      ${ARTIFACT_PATH}"
+          [ "$fail" -eq 0 ] || exit 1
+
+
+      # ───────────────────────────────────────────────────────────────────────
+      # The destructive step. Two properties must stay true:
+      #
+      #  * `--exclude` filters apply to the UPLOAD and the DELETE phase. Because
+      #    of that, every pattern in `sync_exclude_paths` is appended to every
+      #    filter list below — pass 1 AND pass 2. A guard attached to only one
+      #    pass still loses the data, because both passes run with `--delete`.
+      #
+      #  * An excluded pattern is also excluded from the delete decision, which
+      #    is exactly the guarantee we want: keys the build cannot produce (live
+      #    telemetry, runtime JSON, uploads) survive the sync untouched.
+      #
+      # Filters are evaluated left to right and the last match wins, so the
+      # exclusions are appended AFTER the cache-tier filters on purpose.
+      # ───────────────────────────────────────────────────────────────────────
+      - name: Sync artefacts to S3
+        env:
+          ARTIFACT_PATH: ${{ inputs.artifact_path }}
+          TARGET_BUCKET: ${{ inputs.s3_bucket }}
+          SYNC_EXCLUDE_PATHS: ${{ inputs.sync_exclude_paths }}
+          TIERED_CACHE_CONTROL: ${{ inputs.tiered_cache_control }}
+          IMMUTABLE_CACHE_CONTROL: ${{ inputs.immutable_cache_control }}
+          REVALIDATE_CACHE_CONTROL: ${{ inputs.revalidate_cache_control }}
+          IMMUTABLE_EXCLUDE_PATTERNS: ${{ inputs.immutable_exclude_patterns }}
+          REVALIDATE_INCLUDE_PATTERNS: ${{ inputs.revalidate_include_patterns }}
+        run: |
+          set -euo pipefail
+
+          trim() { printf '%s' "$1" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'; }
+
+          # Data-safety guard: patterns this sync must neither upload over nor delete.
+          PROTECTED=()
+          EXCLUDES=()
+          while IFS= read -r pattern; do
+            pattern="$(trim "$pattern")"
+            if [ -n "$pattern" ]; then
+              PROTECTED+=("$pattern")
+              EXCLUDES+=(--exclude "$pattern")
+            fi
+          done <<< "$SYNC_EXCLUDE_PATHS"
+
+          # Cache-tier filters.
+          IMMUTABLE_EXCLUDES=()
+          while IFS= read -r pattern; do
+            pattern="$(trim "$pattern")"
+            if [ -n "$pattern" ]; then
+              IMMUTABLE_EXCLUDES+=(--exclude "$pattern")
+            fi
+          done <<< "$IMMUTABLE_EXCLUDE_PATTERNS"
+
+          REVALIDATE_INCLUDES=()
+          while IFS= read -r pattern; do
+            pattern="$(trim "$pattern")"
+            if [ -n "$pattern" ]; then
+              REVALIDATE_INCLUDES+=(--include "$pattern")
+            fi
+          done <<< "$REVALIDATE_INCLUDE_PATTERNS"
+
+          if [ "${#PROTECTED[@]}" -gt 0 ]; then
+            echo "Data-safety guard active — ${#PROTECTED[@]} pattern(s) protected from upload AND from --delete:"
+            printf '  - %s\n' "${PROTECTED[@]}"
+          else
+            echo "::warning title=No data-safety guard::sync_exclude_paths is empty, so 'aws s3 sync --delete' will remove every destination key that is absent from the artefact. Set sync_exclude_paths if this bucket holds pipeline-written objects."
+          fi
+
+          if [ "$TIERED_CACHE_CONTROL" = "true" ]; then
+            echo "::group::s3 sync (pass 1/2) — immutable assets"
+            echo "Cache-Control: ${IMMUTABLE_CACHE_CONTROL}"
+            aws s3 sync "$ARTIFACT_PATH" "s3://$TARGET_BUCKET" --delete \
+              --cache-control "$IMMUTABLE_CACHE_CONTROL" \
+              "${IMMUTABLE_EXCLUDES[@]}" "${EXCLUDES[@]}"
+            echo "::endgroup::"
+
+            echo "::group::s3 sync (pass 2/2) — revalidated entry points"
+            echo "Cache-Control: ${REVALIDATE_CACHE_CONTROL}"
+            aws s3 sync "$ARTIFACT_PATH" "s3://$TARGET_BUCKET" --delete \
+              --cache-control "$REVALIDATE_CACHE_CONTROL" \
+              "${REVALIDATE_INCLUDES[@]}" "${EXCLUDES[@]}"
+            echo "::endgroup::"
+          else
+            echo "::group::s3 sync — single pass (tiered_cache_control=false)"
+            aws s3 sync "$ARTIFACT_PATH" "s3://$TARGET_BUCKET" --delete "${EXCLUDES[@]}"
+            echo "::endgroup::"
+          fi
+
+
+      - name: Invalidate CloudFront cache
+        if: inputs.cloudfront_distribution_id != ''
+        env:
+          DISTRIBUTION_ID: ${{ inputs.cloudfront_distribution_id }}
+          INVALIDATION_PATHS: ${{ inputs.invalidation_paths }}
+        run: |
+          set -euo pipefail
+
+          PATHS=()
+          while IFS= read -r pattern; do
+            pattern="$(printf '%s' "$pattern" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+            if [ -n "$pattern" ]; then
+              PATHS+=("$pattern")
+            fi
+          done <<< "$INVALIDATION_PATHS"
+
+          if [ "${#PATHS[@]}" -eq 0 ]; then
+            PATHS=("/*")
+          fi
+
+          echo "Invalidating ${#PATHS[@]} path(s) on ${DISTRIBUTION_ID}: ${PATHS[*]}"
+          aws cloudfront create-invalidation \
+            --distribution-id "$DISTRIBUTION_ID" \
+            --paths "${PATHS[@]}"
+
+      - name: Deployment summary
+        if: always()
+        env:
+          TARGET_BUCKET: ${{ inputs.s3_bucket }}
+          CF_DISTRIBUTION_ID: ${{ inputs.cloudfront_distribution_id }}
+          SYNC_EXCLUDE_PATHS: ${{ inputs.sync_exclude_paths }}
+          ARTIFACT_PATH: ${{ inputs.artifact_path }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Static deployment"
+            echo
+            echo "| Item | Value |"
+            echo "|---|---|"
+            echo "| Bucket | \`${TARGET_BUCKET}\` |"
+            echo "| Region | \`${{ inputs.aws_region }}\` |"
+            echo "| Artefact path | \`${ARTIFACT_PATH}\` |"
+            echo "| CloudFront distribution | \`${CF_DISTRIBUTION_ID:-none}\` |"
+            echo "| Tiered cache control | \`${{ inputs.tiered_cache_control }}\` |"
+            echo "| Commit | \`${GITHUB_SHA}\` |"
+            echo
+            if [ -n "${SYNC_EXCLUDE_PATHS}" ]; then
+              echo "### Data-safety guard"
+              echo
+              echo "Protected from upload and from \`--delete\`:"
+              echo
+              echo '```'
+              printf '%s\n' "${SYNC_EXCLUDE_PATHS}"
+              echo '```'
+            else
+              echo "> **No \`sync_exclude_paths\` configured.** The sync ran with a bare \`--delete\`,"
+              echo "> so any object written into this bucket by a runtime pipeline has been removed"
+              echo "> unless the build artefact happened to contain an identical key."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+

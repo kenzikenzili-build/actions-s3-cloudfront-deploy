@@ -1,0 +1,71 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Validation for this repository.
+#
+# The repo is a reusable pipeline that other repositories trust with production
+# credentials, so its own guarantees are tested on every push:
+#
+#   1. no proprietary identifiers or credential shapes anywhere (audit gate),
+#   2. all shell scripts parse,
+#   3. every workflow YAML deserialises,
+#   4. the provisioning script's dry-run contract holds (structure, least
+#      privilege, and "dry-run mutates nothing") against a stubbed AWS CLI.
+#
+# Only actions/checkout is used: the checks themselves are plain shell.
+# ─────────────────────────────────────────────────────────────────────────────
+name: Validate
+
+on:
+  push:
+    branches: [dev, main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Static checks + offline smoke tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Shell syntax
+        run: |
+          set -euo pipefail
+          for script in scripts/setup-project-infra.sh tests/verify-no-identifiers.sh tests/smoke-infra-dryrun.sh tests/smoke-workflow-sync.sh; do
+            bash -n "$script"
+            echo "  ok: $script"
+          done
+
+      - name: Workflow YAML parses
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import glob, sys
+          try:
+              import yaml
+          except ImportError:
+              print("PyYAML unavailable — skipping YAML parse check")
+              sys.exit(0)
+          failed = False
+          for path in sorted(glob.glob(".github/workflows/*.yml")) + sorted(glob.glob("examples/*.yml")):
+              try:
+                  with open(path) as fh:
+                      yaml.safe_load(fh)
+                  print(f"  ok: {path}")
+              except Exception as exc:  # noqa: BLE001 - surface any parse failure
+                  print(f"  FAIL: {path}: {exc}")
+                  failed = True
+          sys.exit(1 if failed else 0)
+          PY
+
+      - name: No proprietary identifiers
+        run: tests/verify-no-identifiers.sh
+
+      - name: Provisioning script dry-run contract
+        run: tests/smoke-infra-dryrun.sh
+
+      - name: Data-safety guard reaches every sync pass
+        run: tests/smoke-workflow-sync.sh
